@@ -1,0 +1,1087 @@
+"""
+Validates the neurotransistor circuit for spiking neural networks.
+Equations:
+    1. Synaptic Current: I_syn = I_res + I_cap = (Vt - Vm)/Rs + Cp·dVt/dt
+    2. Membrane Voltage: C_gb · dVcol/dt = Σ I_syn
+    3. Memcapacitor Conductance: G(x, Vm) = Poole-Frenkel model
+    4. NMOS Current: EKV model
+    5. Output Current: I_out = (VDD - V_drain) / R_out
+
+CORRECTED: Added trapezoidal pulse to match SPICE rise/fall times
+"""
+
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.optimize import curve_fit, fsolve
+from PySpice.Spice.Netlist import Circuit
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 0: PARAMETER CLASS
+# ══════════════════════════════════════════════════════════════════════════════
+class P:
+    # --- Physical Constants ---
+    VT = 0.02585              # Thermal voltage (~25.85mV)
+    
+    # --- MEMCAP Parameters (NamLab HfOx) ---
+    Ar, As = 4.7447e-8, 1.1253e-8
+    Br, Bs = 2.6831, 9.3348
+    Rs = 278                  # Series resistance (Ω)
+    Rp = 8e6                  # Parallel leakage resistance (Ω)
+    Cp = 10e-12               # Parallel capacitance (10 pF)
+    
+    # --- Capacitances ---
+    C_gb = 90e-12             # Explicit SPICE capacitance
+    C_gb_math = 100e-12       # Math model (90pF + 10pF BSIM4 intrinsic)
+    C_out = 5e-12             # Mirror output capacitance
+    
+    # --- Output Stage ---
+    R_out = 10                # Output load resistor (10Ω)
+    VDD = 1.0                 # Supply voltage
+    
+    # ═══════════════════════════════════════════════════════════════
+    # OUTPUT NMOS (IHM_NMOS)
+    # ═══════════════════════════════════════════════════════════════
+    bot_W = 180e-6            # W = 180u
+    bot_L = 60e-6             # L = 60u
+    bot_Level = 14            # LEVEL = 14
+    bot_Vth = 0.3             # Vto = 0.3V
+    bot_Tox = 22e-9           # Tox = 22n
+    
+    # ═══════════════════════════════════════════════════════════════
+    # RESET NMOS
+    # ═══════════════════════════════════════════════════════════════
+    res_W = 100e-6            # W = 100u
+    res_L = 10e-6             # L = 10u
+    res_Level = 14            # LEVEL = 14
+    res_Vth = 0.9             # Vto = 0.9V
+    res_Tox = 3e-9            # Tox = 3n
+    
+    # --- Sweep Parameters ---
+    V_sweep_max = 1.5
+    V_sweep_step = 0.01
+    
+    # NMOS sweep ranges
+    Vd_arr_bot = [0.4, 0.6, 0.8, 1.0]
+    Vg_arr_bot = [0.4, 0.6, 0.8, 1.0]
+    
+    # Reset NMOS sweep ranges
+    Vd_arr_res = [0.6, 0.9, 1.2]
+    Vg_arr_res = [0.6, 0.9, 1.2]
+    
+    # --- Input Pulse Parameters ---
+    V_pulse = 1.0
+    T_on = 2e-6               # Ton = 2µs
+    T_period = 10e-6          # Tperiod = 10µs
+    
+    # --- SPICE Pulse Rise/Fall Times (CRITICAL FIX!) ---
+    T_rise = 1e-6             # Rise time = 1µs (matches SPICE)
+    T_fall = 1e-6             # Fall time = 1µs (matches SPICE)
+    
+    # --- Current Mirror ---
+    GAIN_MIRROR = 5.0
+    R_out_mirr = 100e3
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 1: TRAPEZOIDAL PULSE FUNCTION (NEW!)
+# ══════════════════════════════════════════════════════════════════════════════
+def trapezoidal_pulse(t, t_delay, t_rise, t_on, t_fall, V_high):
+    """
+    Generate pulse with finite rise/fall times to match SPICE PULSE source.
+    
+    SPICE PULSE syntax: PULSE(V1 V2 Td Tr Tf Ton Tperiod)
+    
+    Parameters:
+        t        : Current time
+        t_delay  : Delay before pulse starts
+        t_rise   : Rise time (Tr)
+        t_on     : Pulse width at high level (Ton)
+        t_fall   : Fall time (Tf)
+        V_high   : High voltage level (V2)
+    
+    Returns:
+        Voltage at time t
+    """
+    t_rise_start = t_delay
+    t_rise_end = t_delay + t_rise
+    t_fall_start = t_delay + t_rise + t_on
+    t_fall_end = t_fall_start + t_fall
+    
+    if t < t_rise_start:
+        # Before pulse
+        return 0.0
+    elif t < t_rise_end:
+        # Rising edge (linear ramp)
+        return V_high * (t - t_rise_start) / t_rise
+    elif t < t_fall_start:
+        # High level
+        return V_high
+    elif t < t_fall_end:
+        # Falling edge (linear ramp)
+        return V_high * (1.0 - (t - t_fall_start) / t_fall)
+    else:
+        # After pulse
+        return 0.0
+
+
+def trapezoidal_pulse_periodic(t, t_delay, t_rise, t_on, t_fall, t_period, V_high):
+    """
+    Generate periodic trapezoidal pulse.
+    """
+    # Handle time before first pulse
+    if t < t_delay:
+        return 0.0
+    
+    # Time within current period
+    t_in_period = (t - t_delay) % t_period
+    
+    # Apply single pulse logic within period
+    if t_in_period < t_rise:
+        return V_high * t_in_period / t_rise
+    elif t_in_period < t_rise + t_on:
+        return V_high
+    elif t_in_period < t_rise + t_on + t_fall:
+        return V_high * (1.0 - (t_in_period - t_rise - t_on) / t_fall)
+    else:
+        return 0.0
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 2: CORE MATHEMATICAL FUNCTIONS
+# ══════════════════════════════════════════════════════════════════════════════
+def safe_log_exp(x):
+    """Numerically stable ln(1 + exp(x))"""
+    return np.where(x > 50, x, np.log(1 + np.exp(np.clip(x, -100, 50))))
+
+
+def ekv_model(Vg, Vd, Vs, Is, Vth, kappa, lam):
+    """EKV NMOS drain current model."""
+    Vg = np.maximum(Vg, 0)
+    Vd = np.maximum(Vd, 0)
+    Vs = np.maximum(Vs, 0)
+    
+    term_fwd = (kappa * (Vg - Vth) - Vs) / (2 * P.VT)
+    term_rev = (kappa * (Vg - Vth) - Vd) / (2 * P.VT)
+    
+    I_fwd = safe_log_exp(term_fwd)**2
+    I_rev = safe_log_exp(term_rev)**2
+    
+    Vds = np.maximum(Vd - Vs, 0)
+    return Is * (1 + lam * Vds) * (I_fwd - I_rev)
+
+
+def wrapper_ekv_fit(X, Is, Vth, kappa, lam):
+    """Wrapper for scipy curve_fit"""
+    Vg, Vd, Vs = X
+    return ekv_model(Vg, Vd, Vs, Is, Vth, kappa, lam)
+
+
+def G_memristor(x, Vm):
+    """Memcapacitor conductance (Poole-Frenkel model)"""
+    Vm = np.atleast_1d(Vm)
+    Vm_safe = np.where(np.abs(Vm) < 1e-12, 1e-12, Vm)
+    x_safe = max(x, 1e-12)
+    
+    return (P.Ar * x * np.exp(P.Br * np.sign(Vm_safe) * np.sqrt(np.abs(Vm_safe) / x_safe)) +
+            P.As * x * np.exp(-P.Bs * np.sign(Vm_safe) * np.sqrt(np.abs(Vm_safe))))
+
+
+def solve_memcap_internal(Vt, x):
+    """Solve for internal memcapacitor voltage"""
+    if np.abs(Vt) < 1e-12:
+        return 0.0
+    
+    def residual(Vm):
+        Gm = G_memristor(x, Vm[0])
+        Gm = Gm[0] if isinstance(Gm, np.ndarray) else Gm
+        return [(Vt - Vm[0]) / P.Rs - Vm[0] / P.Rp - Vm[0] * Gm]
+    
+    return float(fsolve(residual, [Vt / 2], xtol=1e-10)[0])
+
+
+def I_memcap(V_in, V_col, x):
+    """Calculate RESISTIVE synaptic current (I_res only)"""
+    Vt = V_in - V_col
+    if np.abs(Vt) < 1e-12:
+        return 0.0
+    Vm = solve_memcap_internal(Vt, x)
+    return (Vt - Vm) / P.Rs
+
+
+def solve_load_line(V_col, params, R_out, VDD):
+    """
+    Solve for operating point with Rout load.
+    
+    At operating point:
+        I_NMOS(Vg, Vd) = (VDD - Vd) / R_out
+    
+    Returns: I_out
+    """
+    Is, Vth, kappa, lam = params
+    
+    if V_col < Vth * 0.5:
+        return 0.0
+    
+    def residual(Vd):
+        Vd = float(max(Vd[0], 0.001))
+        I_ekv = float(ekv_model(V_col, Vd, 0, Is, Vth, kappa, lam))
+        I_load = (VDD - Vd) / R_out
+        return [I_ekv - I_load]
+    
+    try:
+        Vd_solution = fsolve(residual, [VDD/2], xtol=1e-10)[0]
+        Vd_solution = max(min(Vd_solution, VDD), 0)
+    except:
+        Vd_solution = VDD
+    
+    return max((VDD - Vd_solution) / R_out, 0)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 3: NMOS EXTRACTION
+# ══════════════════════════════════════════════════════════════════════════════
+def extract_and_fit_nmos(model_name, W, L, Level, Vth0, Tox, Vd_arr, Vg_arr, C_explicit, C_math):
+    """Extract NMOS characteristics and fit EKV parameters."""
+    
+    X_fit, Y_fit = [], []
+    data_IdVg, data_IdVd = {}, {}
+    
+    # ----- Id-Vg Transfer Characteristics -----
+    print(f"\nExtracting Id-Vg for {model_name}...")
+    for vd in Vd_arr:
+        ckt = Circuit(f'{model_name}_IdVg_Vd{vd}'.replace('.', 'p'))
+        
+        if Level == 14:
+            ckt.model('TEST_NMOS', 'nmos', LEVEL=Level, L=L, W=W, VTH0=Vth0, TOXE=Tox)
+        else:
+            ckt.model('TEST_NMOS', 'nmos', LEVEL=Level, L=L, W=W, Vto=Vth0, Tox=Tox)
+        
+        ckt.V('d', 'drain', ckt.gnd, vd)
+        ckt.V('g', 'gate', ckt.gnd, 0)
+        ckt.MOSFET('M1', 'drain', 'gate', ckt.gnd, ckt.gnd, model='TEST_NMOS')
+        
+        res = ckt.simulator().dc(Vg=slice(0, P.V_sweep_max, P.V_sweep_step))
+        Vg_data = np.array(res.sweep)
+        Id_data = -np.array(res.Vd)
+        
+        data_IdVg[vd] = (Vg_data, Id_data)
+        
+        for vg, id_ in zip(Vg_data, Id_data):
+            X_fit.append([vg, vd, 0.0])
+            Y_fit.append(id_)
+        
+        print(f"  Vd={vd}V: {len(Vg_data)} points")
+    
+    # ----- Id-Vd Output Characteristics -----
+    print(f"\nExtracting Id-Vd for {model_name}...")
+    for vg in Vg_arr:
+        ckt = Circuit(f'{model_name}_IdVd_Vg{vg}'.replace('.', 'p'))
+        
+        if Level == 14:
+            ckt.model('TEST_NMOS', 'nmos', LEVEL=Level, L=L, W=W, VTH0=Vth0, TOXE=Tox)
+        else:
+            ckt.model('TEST_NMOS', 'nmos', LEVEL=Level, L=L, W=W, Vto=Vth0, Tox=Tox)
+        
+        ckt.V('d', 'drain', ckt.gnd, 0)
+        ckt.V('g', 'gate', ckt.gnd, vg)
+        ckt.MOSFET('M1', 'drain', 'gate', ckt.gnd, ckt.gnd, model='TEST_NMOS')
+        
+        res = ckt.simulator().dc(Vd=slice(0, P.V_sweep_max, P.V_sweep_step))
+        Vd_data = np.array(res.sweep)
+        Id_data = -np.array(res.Vd)
+        
+        data_IdVd[vg] = (Vd_data, Id_data)
+        
+        for vd, id_ in zip(Vd_data, Id_data):
+            X_fit.append([vg, vd, 0.0])
+            Y_fit.append(id_)
+        
+        print(f"  Vg={vg}V: {len(Vd_data)} points")
+    
+    # ----- C-V Characteristics -----
+    print(f"\nExtracting C-V for {model_name}...")
+    Vgs_cv = np.linspace(-2.0, 2.0, 51)
+    f_meas = 1e6
+    omega = 2 * np.pi * f_meas
+    Cap_array = []
+    
+    for v_bias in Vgs_cv:
+        ckt = Circuit(f'{model_name}_CV_{v_bias}'.replace('.', 'p').replace('-', 'm'))
+        
+        if Level == 14:
+            ckt.model('TEST_NMOS', 'nmos', LEVEL=Level, L=L, W=W, VTH0=Vth0, TOXE=Tox)
+        else:
+            ckt.model('TEST_NMOS', 'nmos', LEVEL=Level, L=L, W=W, Vto=Vth0, Tox=Tox)
+        
+        ckt.raw_spice += f"Vgate gate 0 DC {v_bias} AC 1\n"
+        ckt.MOSFET('M1', ckt.gnd, 'gate', ckt.gnd, ckt.gnd, model='TEST_NMOS')
+        ckt.C('gb', 'gate', ckt.gnd, C_explicit)
+        
+        res = ckt.simulator().ac(start_frequency=f_meas, stop_frequency=f_meas,
+                                  number_of_points=1, variation='dec')
+        I_gate = np.array(res.branches['vgate'])[0]
+        Cap_array.append(np.abs(np.imag(I_gate)) / omega)
+    
+    Cap_array = np.array(Cap_array)
+    data_CV = (Vgs_cv, Cap_array)
+    
+    # ----- Curve Fitting -----
+    print(f"\nFitting EKV parameters for {model_name}...")
+    X_fit = np.array(X_fit).T
+    Y_fit = np.array(Y_fit)
+    
+    p0 = [1e-6, Vth0, 0.7, 0.1]
+    bounds = ([1e-9, 0.1, 0.1, 0.0], [1e-3, 1.5, 1.5, 2.0])
+    
+    fitted_params, _ = curve_fit(wrapper_ekv_fit, X_fit, Y_fit, p0=p0, bounds=bounds)
+    
+    Is, Vth, kappa, lam = fitted_params
+    print(f"\n  Fitted: Is={Is:.2e}A, Vth={Vth:.3f}V, κ={kappa:.3f}, λ={lam:.3f}")
+    
+    return fitted_params, data_IdVg, data_IdVd, data_CV, C_math
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 4: MEMCAP VALIDATION
+# ══════════════════════════════════════════════════════════════════════════════
+def validate_memcap():
+    """Validate memcapacitor current equation"""
+    print("\n" + "="*60)
+    print("MEMCAP VALIDATION")
+    print("="*60)
+
+    V_in_array = np.linspace(0.01, 1.5, 50)
+    V_col = 0.3
+    x_states = [0.1, 0.15, 0.2, 0.25]
+    
+    results = {}
+    for x in x_states:
+        I_syn = np.array([I_memcap(v_in, V_col, x) for v_in in V_in_array])
+        results[x] = I_syn
+        idx_1v = np.argmin(np.abs(V_in_array - 1.0))
+        print(f"  x={x}: I_syn at V_in=1V = {I_syn[idx_1v]*1e6:.2f} µA")
+    
+    return V_in_array, results
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 5: SINGLE COLUMN LIF VALIDATION (CORRECTED!)
+# ══════════════════════════════════════════════════════════════════════════════
+def validate_single_column(params_bot):
+    """
+    Validate single column LIF behavior with SPICE and Math comparison.
+    
+    CORRECTED: Uses trapezoidal pulse to match SPICE rise/fall times.
+    """
+    print("\n" + "="*60)
+    print("SINGLE COLUMN LIF VALIDATION (CORRECTED)")
+    print("="*60)
+    
+    x = 0.2
+    V_pulse = P.V_pulse
+    Is, Vth, kappa, lam = params_bot
+    R_out = 10  # 10Ω
+    
+    # Pulse parameters (matching SPICE)
+    T_delay = 10e-6
+    T_rise = P.T_rise      # 1µs - CRITICAL!
+    T_on = 80e-6
+    T_fall = P.T_fall      # 1µs - CRITICAL!
+    
+    print(f"  R_out = {R_out} Ω")
+    print(f"  VDD = {P.VDD} V")
+    print(f"  T_rise = {T_rise*1e6:.1f} µs (matching SPICE)")
+    print(f"  T_fall = {T_fall*1e6:.1f} µs (matching SPICE)")
+    
+    memcap_subckt = f"""
+.SUBCKT MEMCAP TE BE SV
+.param Ar={P.Ar} As={P.As} Br={P.Br} Bs={P.Bs} Rp={P.Rp} Rs={P.Rs} Cp={P.Cp}
+.func Gm(x,Vm) {{Ar*x*exp(Br*sgn(Vm)*sqrt(abs(Vm)/x))+As*x*exp(-Bs*sgn(Vm)*sqrt(abs(Vm)))}}
+Bmem IE BE i=V(IE,BE)*Gm(V(SV,0),V(IE,BE))
+Rms TE IE {{Rs}}
+Rmp IE BE {{Rp}}
+Cmp TE BE {{Cp}}
+Cx SV 0 1
+.IC V(SV)={x}
+.ENDS
+"""
+    
+    ckt = Circuit('SingleColumnLIF')
+    ckt.raw_spice += memcap_subckt
+    
+    # SPICE pulse with 1µs rise/fall times
+    ckt.raw_spice += f"Vinput vin 0 PULSE(0 {V_pulse} {T_delay} {T_rise} {T_fall} {T_on} 200u)\n"
+    ckt.raw_spice += f"Vdd vdd 0 DC 1.0\n"
+    ckt.raw_spice += f"Xmem vin col sv MEMCAP\n"
+    ckt.raw_spice += f"Cgb col 0 {P.C_gb}\n"
+    
+    if P.bot_Level == 14:
+        ckt.raw_spice += f".model NMOS_BOT nmos LEVEL={P.bot_Level} L={P.bot_L} W={P.bot_W} VTH0={P.bot_Vth} TOXE={P.bot_Tox}\n"
+    else:
+        ckt.raw_spice += f".model NMOS_BOT nmos LEVEL={P.bot_Level} L={P.bot_L} W={P.bot_W} Vto={P.bot_Vth} Tox={P.bot_Tox}\n"
+    
+    ckt.raw_spice += f"Rout vdd drain {R_out}\n"
+    ckt.raw_spice += f"M1 drain col 0 0 NMOS_BOT\n"
+    ckt.raw_spice += ".save all\n"
+    
+    # Run simulation
+    simulator = ckt.simulator()
+    res = simulator.transient(step_time=0.5e-6, end_time=150e-6)
+    
+    t_spice = np.array(res.time)
+    
+    # Access nodes
+    try:
+        V_col_spice = np.array(res['col'])
+    except:
+        V_col_spice = np.zeros_like(t_spice)
+        for key in res.nodes.keys():
+            if 'col' in key.lower():
+                V_col_spice = np.array(res[key])
+                break
+    
+    try:
+        V_in_spice = np.array(res['vin'])
+    except:
+        V_in_spice = np.zeros_like(t_spice)
+        for key in res.nodes.keys():
+            if 'vin' in key.lower():
+                V_in_spice = np.array(res[key])
+                break
+    
+    try:
+        V_drain_spice = np.array(res['drain'])
+    except:
+        V_drain_spice = np.ones_like(t_spice) * 1.0
+        for key in res.nodes.keys():
+            if 'drain' in key.lower():
+                V_drain_spice = np.array(res[key])
+                break
+    
+    I_out_spice = (P.VDD - V_drain_spice) / R_out
+    
+    print(f"  SPICE: max V_in = {np.max(V_in_spice):.3f} V")
+    print(f"  SPICE: max V_col = {np.max(V_col_spice):.3f} V")
+    print(f"  SPICE: max I_out = {np.max(I_out_spice)*1e3:.2f} mA")
+    
+    # ----- Math Model (CORRECTED!) -----
+    print("\nRunning Math model (with trapezoidal pulse)...")
+    
+    t_math = np.linspace(0, 150e-6, 1000)
+    dt = t_math[1] - t_math[0]
+    V_col_math = np.zeros_like(t_math)
+    V_in_math = np.zeros_like(t_math)
+    I_out_math = np.zeros_like(t_math)
+    
+    Vt_prev = 0.0
+    V_in_prev = 0.0
+    
+    for i in range(1, len(t_math)):
+        # CORRECTED: Use trapezoidal pulse instead of ideal step!
+        V_in = trapezoidal_pulse(t_math[i-1], T_delay, T_rise, T_on, T_fall, V_pulse)
+        V_in_math[i] = V_in
+        
+        Vt = V_in - V_col_math[i-1]
+        Vm = solve_memcap_internal(Vt, x)
+        I_res = (Vt - Vm) / P.Rs
+        
+        # CORRECTED: Capacitive current uses actual dV_in/dt from trapezoidal pulse
+        dV_in_dt = (V_in - V_in_prev) / dt
+        I_cap = P.Cp * dV_in_dt
+        
+        I_syn = I_res + I_cap
+        
+        dV_dt = I_syn / P.C_gb_math
+        V_col_math[i] = max(0, V_col_math[i-1] + dV_dt * dt)
+        
+        Vt_prev = Vt
+        V_in_prev = V_in
+        
+        I_out_math[i] = solve_load_line(V_col_math[i], params_bot, R_out, P.VDD)
+    
+    print(f"  Math: max V_col = {np.max(V_col_math):.3f} V")
+    print(f"  Math: max I_out = {np.max(I_out_math)*1e3:.2f} mA")
+    
+    return {
+        't_spice': t_spice,
+        'V_col_spice': V_col_spice,
+        'I_out_spice': I_out_spice,
+        'V_in_spice': V_in_spice,
+        't_math': t_math,
+        'V_col_math': V_col_math,
+        'I_out_math': I_out_math,
+        'V_in_math': V_in_math,
+        'R_out': R_out
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 6: MULTI-INPUT COLUMN LIF (CORRECTED!)
+# ══════════════════════════════════════════════════════════════════════════════
+def validate_multi_column(params_bot):
+    """
+    Validate 3-input column LIF with SPICE and Math comparison.
+    
+    CORRECTED: Uses trapezoidal pulse to match SPICE rise/fall times.
+    """
+    print("\n" + "="*60)
+    print("3-INPUT COLUMN LIF VALIDATION (CORRECTED)")
+    print("="*60)
+    
+    Is, Vth, kappa, lam = params_bot
+    
+    x_states = [0.15, 0.2, 0.25]
+    delays = [10e-6, 30e-6, 50e-6]
+    pulse_width = 40e-6
+    V_pulse = P.V_pulse
+    R_out = 10
+    
+    # Pulse parameters (matching SPICE)
+    T_rise = P.T_rise      # 1µs
+    T_fall = P.T_fall      # 1µs
+    
+    print(f"  R_out = {R_out} Ω")
+    print(f"  T_rise = {T_rise*1e6:.1f} µs, T_fall = {T_fall*1e6:.1f} µs")
+    print(f"  Row 0: x={x_states[0]}, delay={delays[0]*1e6:.0f}µs")
+    print(f"  Row 1: x={x_states[1]}, delay={delays[1]*1e6:.0f}µs")
+    print(f"  Row 2: x={x_states[2]}, delay={delays[2]*1e6:.0f}µs")
+    
+    # ══════════════════════════════════════════════════════════════════════════
+    # SPICE SIMULATION
+    # ══════════════════════════════════════════════════════════════════════════
+    
+    memcap_subckt = f"""
+.SUBCKT MEMCAP TE BE SV
+.param Ar={P.Ar} As={P.As} Br={P.Br} Bs={P.Bs} Rp={P.Rp} Rs={P.Rs} Cp={P.Cp}
+.func Gm(x,Vm) {{Ar*x*exp(Br*sgn(Vm)*sqrt(abs(Vm)/x))+As*x*exp(-Bs*sgn(Vm)*sqrt(abs(Vm)))}}
+Bmem IE BE i=V(IE,BE)*Gm(V(SV,0),V(IE,BE))
+Rms TE IE {{Rs}}
+Rmp IE BE {{Rp}}
+Cmp TE BE {{Cp}}
+Cx SV 0 1
+.ENDS
+"""
+    
+    ckt = Circuit('MultiColumnLIF')
+    ckt.raw_spice += memcap_subckt
+    
+    # 3 input sources with trapezoidal pulses
+    ckt.raw_spice += f"Vin0 vin0 0 PULSE(0 {V_pulse} {delays[0]} {T_rise} {T_fall} {pulse_width} 200u)\n"
+    ckt.raw_spice += f"Vin1 vin1 0 PULSE(0 {V_pulse} {delays[1]} {T_rise} {T_fall} {pulse_width} 200u)\n"
+    ckt.raw_spice += f"Vin2 vin2 0 PULSE(0 {V_pulse} {delays[2]} {T_rise} {T_fall} {pulse_width} 200u)\n"
+    
+    ckt.raw_spice += f"Vdd vdd 0 DC 1.0\n"
+    
+    ckt.raw_spice += f"Xmem0 vin0 col sv0 MEMCAP\n"
+    ckt.raw_spice += f".IC V(sv0)={x_states[0]}\n"
+    
+    ckt.raw_spice += f"Xmem1 vin1 col sv1 MEMCAP\n"
+    ckt.raw_spice += f".IC V(sv1)={x_states[1]}\n"
+    
+    ckt.raw_spice += f"Xmem2 vin2 col sv2 MEMCAP\n"
+    ckt.raw_spice += f".IC V(sv2)={x_states[2]}\n"
+    
+    ckt.raw_spice += f"Cgb col 0 {P.C_gb}\n"
+    
+    if P.bot_Level == 14:
+        ckt.raw_spice += f".model NMOS_BOT nmos LEVEL={P.bot_Level} L={P.bot_L} W={P.bot_W} VTH0={P.bot_Vth} TOXE={P.bot_Tox}\n"
+    else:
+        ckt.raw_spice += f".model NMOS_BOT nmos LEVEL={P.bot_Level} L={P.bot_L} W={P.bot_W} Vto={P.bot_Vth} Tox={P.bot_Tox}\n"
+    
+    ckt.raw_spice += f"Rout vdd drain {R_out}\n"
+    ckt.raw_spice += f"M1 drain col 0 0 NMOS_BOT\n"
+    ckt.raw_spice += ".save all\n"
+    
+    simulator = ckt.simulator()
+    res = simulator.transient(step_time=0.5e-6, end_time=150e-6)
+    
+    t_spice = np.array(res.time)
+    
+    try:
+        V_col_spice = np.array(res['col'])
+    except:
+        V_col_spice = np.zeros_like(t_spice)
+        for key in res.nodes.keys():
+            if 'col' in key.lower():
+                V_col_spice = np.array(res[key])
+                break
+    
+    try:
+        V_drain_spice = np.array(res['drain'])
+    except:
+        V_drain_spice = np.ones_like(t_spice) * 1.0
+        for key in res.nodes.keys():
+            if 'drain' in key.lower():
+                V_drain_spice = np.array(res[key])
+                break
+    
+    V_in_spice = []
+    for i in range(3):
+        try:
+            V_in_spice.append(np.array(res[f'vin{i}']))
+        except:
+            V_in_spice.append(np.zeros_like(t_spice))
+            for key in res.nodes.keys():
+                if f'vin{i}' in key.lower():
+                    V_in_spice[i] = np.array(res[key])
+                    break
+    
+    I_out_spice = (P.VDD - V_drain_spice) / R_out
+    
+    print(f"\n  SPICE: max V_col = {np.max(V_col_spice):.3f} V")
+    print(f"  SPICE: max I_out = {np.max(I_out_spice)*1e3:.2f} mA")
+    
+    # ══════════════════════════════════════════════════════════════════════════
+    # MATH MODEL (CORRECTED!)
+    # ══════════════════════════════════════════════════════════════════════════
+    
+    print("\nRunning Math model (with trapezoidal pulse)...")
+    
+    t_math = np.linspace(0, 150e-6, 1000)
+    dt = t_math[1] - t_math[0]
+    V_col_math = np.zeros_like(t_math)
+    V_in_math = [np.zeros_like(t_math) for _ in range(3)]
+    I_out_math = np.zeros_like(t_math)
+    
+    V_in_prev = [0.0, 0.0, 0.0]
+    
+    for i in range(1, len(t_math)):
+        I_syn_total = 0.0
+        
+        for row in range(3):
+            # CORRECTED: Use trapezoidal pulse!
+            V_in = trapezoidal_pulse(t_math[i-1], delays[row], T_rise, pulse_width, T_fall, V_pulse)
+            V_in_math[row][i] = V_in
+            
+            Vt = V_in - V_col_math[i-1]
+            Vm = solve_memcap_internal(Vt, x_states[row])
+            I_res = (Vt - Vm) / P.Rs
+            
+            # CORRECTED: Proper dV_in/dt calculation
+            dV_in_dt = (V_in - V_in_prev[row]) / dt
+            I_cap = P.Cp * dV_in_dt
+            
+            I_syn_total += (I_res + I_cap)
+            V_in_prev[row] = V_in
+        
+        dV_dt = I_syn_total / P.C_gb_math
+        V_col_math[i] = max(0, V_col_math[i-1] + dV_dt * dt)
+        
+        I_out_math[i] = solve_load_line(V_col_math[i], params_bot, R_out, P.VDD)
+    
+    print(f"  Math: max V_col = {np.max(V_col_math):.3f} V")
+    print(f"  Math: max I_out = {np.max(I_out_math)*1e3:.2f} mA")
+    
+    return {
+        't_spice': t_spice,
+        'V_col_spice': V_col_spice,
+        'I_out_spice': I_out_spice,
+        'V_in_spice': V_in_spice,
+        't_math': t_math,
+        'V_col_math': V_col_math,
+        'I_out_math': I_out_math,
+        'V_in_math': V_in_math,
+        'R_out': R_out
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 7: PULSE WIDTH ANALYSIS
+# ══════════════════════════════════════════════════════════════════════════════
+def analyze_pulse_width(params_bot, x=0.2):
+    """Find required pulse width for MNIST encoding."""
+    print("\n" + "="*60)
+    print("PULSE WIDTH ANALYSIS")
+    print("="*60)
+
+    Is, Vth_fitted, kappa, lam = params_bot
+    Vth_target = P.bot_Vth
+    
+    print(f"\n1. CONTINUOUS PULSE INPUT:")
+    
+    t_cont = np.linspace(0, 100e-6, 5000)
+    dt = t_cont[1] - t_cont[0]
+    V_cont = np.zeros_like(t_cont)
+    
+    V_in_prev = 0.0
+    
+    for i in range(1, len(t_cont)):
+        # Use trapezoidal pulse for consistency
+        V_in = trapezoidal_pulse(t_cont[i-1], 0, P.T_rise, 100e-6, P.T_fall, P.V_pulse)
+        
+        Vt = V_in - V_cont[i-1]
+        Vm = solve_memcap_internal(Vt, x)
+        I_res = (Vt - Vm) / P.Rs
+        dV_in_dt = (V_in - V_in_prev) / dt
+        I_cap = P.Cp * dV_in_dt
+        I_syn = I_res + I_cap
+        V_cont[i] = max(0, V_cont[i-1] + I_syn / P.C_gb_math * dt)
+        V_in_prev = V_in
+    
+    V_steady = V_cont[-1]
+    
+    idx_vth = np.argmax(V_cont >= Vth_target)
+    t_to_vth = t_cont[idx_vth] if idx_vth > 0 else float('inf')
+    
+    print(f"  V_steady = {V_steady:.3f}V")
+    print(f"  Time to reach Vth={Vth_target}V: {t_to_vth*1e6:.1f} µs")
+    
+    if V_steady < Vth_target:
+        print(f"\n   V_steady < Vth, neuron cannot fire!")
+    
+    # ----- Pulsed Input Analysis -----
+    print(f"\n2. PULSED INPUT (Ton={P.T_on*1e6:.0f}µs, Period={P.T_period*1e6:.0f}µs):")
+    
+    t_pulsed = np.linspace(0, 500e-6, 25000)
+    dt_p = t_pulsed[1] - t_pulsed[0]
+    V_pulsed = np.zeros_like(t_pulsed)
+    
+    V_in_prev_p = 0.0
+    
+    pulses_to_vth = 0
+    reached_vth = False
+    pulse_count = 0
+    last_pulse_state = False
+    
+    for i in range(1, len(t_pulsed)):
+        V_in = trapezoidal_pulse_periodic(t_pulsed[i-1], 0, P.T_rise, P.T_on, P.T_fall, P.T_period, P.V_pulse)
+        
+        pulse_on = V_in > 0.5 * P.V_pulse
+        if pulse_on and not last_pulse_state:
+            pulse_count += 1
+        last_pulse_state = pulse_on
+        
+        Vt = V_in - V_pulsed[i-1]
+        Vm = solve_memcap_internal(Vt, x)
+        I_res = (Vt - Vm) / P.Rs
+        dV_in_dt = (V_in - V_in_prev_p) / dt_p
+        I_cap = P.Cp * dV_in_dt
+        I_syn = I_res + I_cap
+        V_pulsed[i] = max(0, V_pulsed[i-1] + I_syn / P.C_gb_math * dt_p)
+        V_in_prev_p = V_in
+        
+        if not reached_vth and V_pulsed[i] >= Vth_target:
+            pulses_to_vth = pulse_count
+            reached_vth = True
+            print(f"\n   Reached Vth after {pulses_to_vth} pulses!")
+            print(f"    Total time = {t_pulsed[i]*1e6:.1f} µs")
+    
+    if not reached_vth:
+        V_max = np.max(V_pulsed)
+        print(f"\n  Did NOT reach Vth within {pulse_count} pulses")
+        print(f"    Max V_col = {V_max:.3f}V, Gap = {Vth_target - V_max:.3f}V")
+        
+        if V_max > 0:
+            V_per_pulse = V_max / pulse_count
+            pulses_estimated = int(np.ceil(Vth_target / V_per_pulse))
+            print(f"    Estimated pulses needed ≈ {pulses_estimated}")
+            pulses_to_vth = pulses_estimated
+    
+    return {
+        't_continuous': t_cont,
+        'V_continuous': V_cont,
+        't_to_vth': t_to_vth,
+        'V_steady': V_steady,
+        'Vth_target': Vth_target,
+        't_pulsed': t_pulsed,
+        'V_pulsed': V_pulsed,
+        'pulses_to_vth': pulses_to_vth,
+        'T_on': P.T_on,
+        'T_period': P.T_period
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 8: PLOTTING FUNCTIONS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def plot_nmos_comparison(params_bot, data_bot, params_res, data_res):
+    """Plot BOTH NMOS types for comparison - Figure 1"""
+    
+    fig, axs = plt.subplots(2, 3, figsize=(15, 8))
+    colors = ['#8E44AD', '#E91E8C', '#27AE60', '#3498DB']
+    
+    # ----- Row 0: Output NMOS -----
+    data_IdVg_bot, data_IdVd_bot, data_CV_bot, C_math_bot = data_bot
+    Is_b, Vth_b, kappa_b, lam_b = params_bot
+    
+    for i, vd in enumerate(P.Vd_arr_bot):
+        Vg, Id = data_IdVg_bot[vd]
+        axs[0,0].semilogy(Vg, Id*1e6, '-', color=colors[i], lw=1.5, label=f'SPICE Vd={vd}V')
+        axs[0,0].semilogy(Vg, ekv_model(Vg, vd, 0, *params_bot)*1e6, '--', color=colors[i], lw=2, alpha=0.7)
+    axs[0,0].set_xlabel('Vg (V)')
+    axs[0,0].set_ylabel('Id (µA)')
+    axs[0,0].set_title('Output NMOS Id-Vg')
+    axs[0,0].legend(fontsize=7)
+    axs[0,0].grid(True, alpha=0.3)
+    
+    for i, vg in enumerate(P.Vg_arr_bot):
+        Vd, Id = data_IdVd_bot[vg]
+        axs[0,1].plot(Vd, Id*1e6, '-', color=colors[i], lw=1.5, label=f'SPICE Vg={vg}V')
+        axs[0,1].plot(Vd, ekv_model(vg, Vd, 0, *params_bot)*1e6, '--', color=colors[i], lw=2, alpha=0.7)
+    axs[0,1].set_xlabel('Vd (V)')
+    axs[0,1].set_ylabel('Id (µA)')
+    axs[0,1].set_title('Output NMOS Id-Vd')
+    axs[0,1].legend(fontsize=7)
+    axs[0,1].grid(True, alpha=0.3)
+    
+    Vgs_cv, Cap_cv = data_CV_bot
+    axs[0,2].plot(Vgs_cv, Cap_cv*1e12, 'b-', lw=2, label='SPICE')
+    axs[0,2].axhline(C_math_bot*1e12, color='k', ls='--', lw=1.5, label=f'C_math={C_math_bot*1e12:.0f}pF')
+    axs[0,2].axvline(Vth_b, color='gray', ls=':', label=f'Vth={Vth_b:.2f}V')
+    axs[0,2].set_xlabel('Vgs (V)')
+    axs[0,2].set_ylabel('C (pF)')
+    axs[0,2].set_title('Output NMOS C-V')
+    axs[0,2].legend(fontsize=7)
+    axs[0,2].grid(True, alpha=0.3)
+    
+    # ----- Row 1: Reset NMOS -----
+    data_IdVg_res, data_IdVd_res, data_CV_res, C_math_res = data_res
+    Is_r, Vth_r, kappa_r, lam_r = params_res
+    
+    for i, vd in enumerate(P.Vd_arr_res):
+        Vg, Id = data_IdVg_res[vd]
+        axs[1,0].semilogy(Vg, Id*1e6, '-', color=colors[i], lw=1.5, label=f'SPICE Vd={vd}V')
+        axs[1,0].semilogy(Vg, ekv_model(Vg, vd, 0, *params_res)*1e6, '--', color=colors[i], lw=2, alpha=0.7)
+    axs[1,0].set_xlabel('Vg (V)')
+    axs[1,0].set_ylabel('Id (µA)')
+    axs[1,0].set_title('Reset NMOS Id-Vg')
+    axs[1,0].legend(fontsize=7)
+    axs[1,0].grid(True, alpha=0.3)
+    
+    for i, vg in enumerate(P.Vg_arr_res):
+        Vd, Id = data_IdVd_res[vg]
+        axs[1,1].plot(Vd, Id*1e6, '-', color=colors[i], lw=1.5, label=f'SPICE Vg={vg}V')
+        axs[1,1].plot(Vd, ekv_model(vg, Vd, 0, *params_res)*1e6, '--', color=colors[i], lw=2, alpha=0.7)
+    axs[1,1].set_xlabel('Vd (V)')
+    axs[1,1].set_ylabel('Id (µA)')
+    axs[1,1].set_title('Reset NMOS Id-Vd')
+    axs[1,1].legend(fontsize=7)
+    axs[1,1].grid(True, alpha=0.3)
+    
+    Vgs_cv_r, Cap_cv_r = data_CV_res
+    axs[1,2].plot(Vgs_cv_r, Cap_cv_r*1e12, 'r-', lw=2, label='SPICE')
+    axs[1,2].axvline(Vth_r, color='gray', ls=':', label=f'Vth={Vth_r:.2f}V')
+    axs[1,2].set_xlabel('Vgs (V)')
+    axs[1,2].set_ylabel('C (pF)')
+    axs[1,2].set_title('Reset NMOS C-V')
+    axs[1,2].legend(fontsize=7)
+    axs[1,2].grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig('figure1_nmos_both.png', dpi=200)
+    plt.show()
+
+
+def plot_single_column_lif(column_data):
+    """Plot Single Column LIF - Figure 2"""
+    fig, axs = plt.subplots(3, 1, figsize=(10, 9), sharex=True)
+    fig.suptitle('Single Column LIF Validation (Corrected)', fontsize=14, fontweight='bold')
+    
+    t_sp = column_data['t_spice']
+    V_col_sp = column_data['V_col_spice']
+    I_out_sp = column_data['I_out_spice']
+    V_in_sp = column_data['V_in_spice']
+    
+    t_m = column_data['t_math']
+    V_col_m = column_data['V_col_math']
+    I_out_m = column_data['I_out_math']
+    V_in_m = column_data['V_in_math']
+    
+    Vth_target = P.bot_Vth
+    axs[0].set_title('Input Voltage')
+    # ----- Panel 1: Input Voltage -----
+    axs[0].plot(t_m*1e6, V_in_m, 'g-', lw=1.5, label='$V_{in}$ (Math)')
+    if np.max(V_in_sp) > 0.1:
+        axs[0].plot(t_sp*1e6, V_in_sp, 'b--', lw=1.5, label='$V_{in}$ (SPICE)')
+    axs[0].set_ylabel('$V_{in}$ (V)')
+    axs[0].set_ylim(-0.05, 1.15)
+    axs[0].legend(loc='upper right', fontsize=9)
+    axs[0].grid(True, alpha=0.3)
+    
+    
+    # ----- Panel 2: V_col (SPICE vs Math) -----
+    axs[1].plot(t_m*1e6, V_col_m, 'r--', lw=2, label='Math')
+    if np.max(V_col_sp) > 0.01:
+        axs[1].plot(t_sp*1e6, V_col_sp, 'b-', lw=1.5, label='SPICE')
+    axs[1].axhline(Vth_target, color='gray', ls=':', lw=1.5, label=f'$V_{{th}}$={Vth_target}V')
+    axs[1].set_ylabel('$V_{col}$ (V)')
+    axs[1].legend(loc='upper right', fontsize=9)
+    axs[1].grid(True, alpha=0.3)
+    axs[1].set_title('LIF Membrane Voltage')
+    
+    # ----- Panel 3: I_out (SPICE vs Math) -----
+    axs[2].plot(t_m*1e6, I_out_m*1e3, 'r--', lw=2, label='Math')
+    if np.max(I_out_sp) > 1e-6:
+        axs[2].plot(t_sp*1e6, I_out_sp*1e3, 'b-', lw=1.5, label='SPICE')
+    axs[2].set_ylabel('$I_{out}$ (mA)')
+    axs[2].set_xlabel('Time (µs)')
+    axs[2].legend(loc='upper right', fontsize=9)
+    axs[2].grid(True, alpha=0.3)
+    axs[2].set_title('Output Current (SPICE vs Math)')
+    
+    plt.tight_layout()
+    plt.savefig('figure2_single_lif_corrected.png', dpi=200)
+    plt.show()
+
+
+def plot_multi_column_lif(multi_col_data):
+    """Plot 3-Input Column LIF - Figure 3"""
+    fig, axs = plt.subplots(3, 1, figsize=(10, 9), sharex=True)
+    fig.suptitle('3-Input Column LIF Validation ', fontsize=14, fontweight='bold')
+    
+    t_sp = multi_col_data['t_spice']
+    V_col_sp = multi_col_data['V_col_spice']
+    I_out_sp = multi_col_data['I_out_spice']
+    V_in_sp = multi_col_data['V_in_spice']
+    
+    t_m = multi_col_data['t_math']
+    V_col_m = multi_col_data['V_col_math']
+    I_out_m = multi_col_data['I_out_math']
+    V_in_m = multi_col_data['V_in_math']
+    
+    Vth_target = P.bot_Vth
+    row_colors = ['#E91E63', '#4CAF50', '#2196F3']
+    
+    # ----- Panel 1: Input Voltages -----
+    for row in range(3):
+        axs[0].plot(t_m*1e6, V_in_m[row], color=row_colors[row], lw=1.5, 
+                    label=f'$V_{{in,{row+1}}}$ (Math)')
+        if np.max(V_in_sp[row]) > 0.1:
+            axs[0].plot(t_sp*1e6, V_in_sp[row], '--', color=row_colors[row], 
+                        lw=1.2, alpha=0.7)
+    
+    axs[0].set_ylabel('$V_{in}$ (V)')
+    axs[0].set_ylim(-0.05, 1.15)
+    axs[0].legend(loc='upper right', fontsize=8)
+    axs[0].grid(True, alpha=0.3)
+    axs[0].set_title('Input Voltages')
+    
+    # ----- Panel 2: V_col -----
+    axs[1].plot(t_m*1e6, V_col_m, 'r--', lw=2, label='Math')
+    if np.max(V_col_sp) > 0.01:
+        axs[1].plot(t_sp*1e6, V_col_sp, 'b-', lw=1.5, label='SPICE')
+    axs[1].axhline(Vth_target, color='gray', ls=':', lw=1.5, label=f'$V_{{th}}$={Vth_target}V')
+    axs[1].set_ylabel('$V_{col}$ (V)')
+    axs[1].legend(loc='upper right', fontsize=9)
+    axs[1].grid(True, alpha=0.3)
+    axs[1].set_title('LIF Membrane Voltage')
+    
+    # ----- Panel 3: I_out -----
+    axs[2].plot(t_m*1e6, I_out_m*1e3, 'r--', lw=2, label='Math')
+    if np.max(I_out_sp) > 1e-6:
+        axs[2].plot(t_sp*1e6, I_out_sp*1e3, 'b-', lw=1.5, label='SPICE')
+    axs[2].set_ylabel('$I_{out}$ (mA)')
+    axs[2].set_xlabel('Time (µs)')
+    axs[2].legend(loc='upper right', fontsize=9)
+    axs[2].grid(True, alpha=0.3)
+    axs[2].set_title('Output Current (SPICE vs Math)')
+    
+    plt.tight_layout()
+    plt.savefig('figure3_multi_lif_corrected.png', dpi=200)
+    plt.show()
+
+
+def plot_memcap_validation(memcap_data):
+    """Plot MEMCAP current validation - Figure 4"""
+    V_in, mem_results = memcap_data
+    colors = ['#8E44AD', '#E91E8C', '#27AE60', '#3498DB']
+    
+    fig, ax = plt.subplots(figsize=(8, 5))
+    
+    for i, (x, I_syn) in enumerate(mem_results.items()):
+        ax.plot(V_in, I_syn*1e6, color=colors[i], lw=2, label=f'x={x}')
+    
+    ax.axvline(0.3, color='gray', ls=':', lw=1, label='$V_{col}$=0.3V')
+    ax.set_xlabel('$V_{in}$ (V)')
+    ax.set_ylabel('$I_{syn}$ (µA)')
+    ax.set_title('MEMCAP Synaptic Current', fontsize=12, fontweight='bold')
+    ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig('figure4_memcap.png', dpi=200)
+    plt.show()
+
+
+def plot_pulse_analysis(pulse_data):
+    """Plot pulse width analysis - Figure 5"""
+    fig, axs = plt.subplots(1, 2, figsize=(12, 4))
+    fig.suptitle('Pulse Width Analysis', fontsize=14, fontweight='bold')
+    
+    Vth_target = pulse_data['Vth_target']
+    
+    t_cont = pulse_data['t_continuous']
+    V_cont = pulse_data['V_continuous']
+    t_to_vth = pulse_data['t_to_vth']
+    V_steady = pulse_data['V_steady']
+    
+    axs[0].plot(t_cont*1e6, V_cont, 'g-', lw=2)
+    axs[0].axhline(Vth_target, color='r', ls='--', lw=1.5, label=f'$V_{{th}}$={Vth_target}V')
+    if t_to_vth < float('inf'):
+        axs[0].axvline(t_to_vth*1e6, color='r', ls=':', lw=1.5, label=f't={t_to_vth*1e6:.1f}µs')
+    axs[0].axhline(V_steady, color='orange', ls='--', lw=1, label=f'$V_{{ss}}$={V_steady:.3f}V')
+    axs[0].set_xlabel('Time (µs)')
+    axs[0].set_ylabel('$V_{col}$ (V)')
+    axs[0].set_title('Continuous Pulse Input')
+    axs[0].legend(fontsize=8)
+    axs[0].grid(True, alpha=0.3)
+    axs[0].set_xlim([0, min(t_to_vth*1e6*3 if t_to_vth < float('inf') else 100, 100)])
+    
+    t_pulsed = pulse_data['t_pulsed'][:5000]
+    V_pulsed = pulse_data['V_pulsed'][:5000]
+    
+    axs[1].plot(t_pulsed*1e6, V_pulsed, 'b-', lw=1.5)
+    axs[1].axhline(Vth_target, color='r', ls='--', lw=1.5, label=f'$V_{{th}}$={Vth_target}V')
+    axs[1].set_xlabel('Time (µs)')
+    axs[1].set_ylabel('$V_{col}$ (V)')
+    axs[1].set_title('Pulsed Input')
+    axs[1].legend(fontsize=8)
+    axs[1].grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig('figure5_pulse_analysis.png', dpi=200)
+    plt.show()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 9: MAIN EXECUTION
+# ══════════════════════════════════════════════════════════════════════════════
+if __name__ == "__main__":
+    
+    print("="*60)
+    print("NEUROTRANSISTOR VALIDATION MODEL (CORRECTED)")
+    print("="*60)
+    print(f"\nKey Fix: Using trapezoidal pulse with T_rise={P.T_rise*1e6}µs, T_fall={P.T_fall*1e6}µs")
+    print("This matches SPICE PULSE source and eliminates high-frequency oscillations.\n")
+    
+    # ----- Extract BOTH NMOS types -----
+    params_bot, *data_bot_tuple = extract_and_fit_nmos(
+        'Output_NMOS', P.bot_W, P.bot_L, P.bot_Level, P.bot_Vth, P.bot_Tox,
+        P.Vd_arr_bot, P.Vg_arr_bot, P.C_gb, P.C_gb_math
+    )
+    data_bot = data_bot_tuple
+    
+    params_res, *data_res_tuple = extract_and_fit_nmos(
+        'Reset_NMOS', P.res_W, P.res_L, P.res_Level, P.res_Vth, P.res_Tox,
+        P.Vd_arr_res, P.Vg_arr_res, 0, 0
+    )
+    data_res = data_res_tuple
+    
+    # ----- Run validations -----
+    memcap_data = validate_memcap()
+    column_data = validate_single_column(params_bot)
+    multi_col_data = validate_multi_column(params_bot)
+    pulse_data = analyze_pulse_width(params_bot)
+    
+    # ----- Generate plots -----
+    plot_nmos_comparison(params_bot, data_bot, params_res, data_res)
+    plot_single_column_lif(column_data)
+    plot_multi_column_lif(multi_col_data)
+    plot_memcap_validation(memcap_data)
+    plot_pulse_analysis(pulse_data)
+    
+    print("\n" + "="*60)
+    print("All figures generated successfully!")
+    print("="*60)
