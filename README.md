@@ -1,73 +1,69 @@
 # Neuro-Transistor Circuit Design and Simulation
 
-This repository contains the simulation code for a neuro-transistor-based spiking neuron circuit for spiking neural networks. The project solves five main problems: mathematical modelling, NMOS parameter extraction, gate-node loading, reset after firing, and multi-layer spike propagation.
+This repository contains simulation code for a neuro-transistor-based spiking neuron circuit. The project develops a mathematical model, verifies device parameters, adds circuit improvements, and demonstrates multi-layer spike propagation.
 
-## Project Summary
+## What This Project Solves
 
-The work implements and verifies:
-
-- a mathematical model for the neuro-transistor using memristive conductance, membrane capacitance, and EKV transistor equations,
-- NMOS parameter extraction from Id-Vg, Id-Vd, and C-V characteristics,
-- a PMOS current mirror to isolate the high-impedance gate node,
-- a reset circuit to discharge the membrane after a spike,
-- MNIST-based pulse input testing,
-- and a connected two-layer architecture where three input neurons drive a fourth output neuron.
+- Developed a mathematical model for the neuro-transistor using memristive conductance, membrane capacitance, and EKV transistor equations.
+- Verified NMOS behavior using Id-Vg, Id-Vd, and C-V characteristics.
+- Added a PMOS current mirror to isolate the high-impedance gate node.
+- Implemented a reset circuit so the membrane voltage discharges after firing.
+- Tested different ON/OFF memristor weight configurations.
+- Built a connected two-layer network where three input neurons drive a fourth output neuron.
 
 ## Results
 
-### NMOS Model and C-V Verification
+### NMOS and C-V Parameter Extraction
 
-![Id Vg characteristics](images/slide09_image1.png)
-![Id Vd characteristics](images/slide09_image2.png)
-![CV characteristics](images/slide09_image3.png)
+![NMOS and CV validation](images/slide-09.png)
 
-The NMOS model was verified using EKV-based equations and PySpice simulations. The extracted parameters include approximately `Vth = 0.277 V`, `kappa = 0.516`, and membrane capacitance around `100 pF`.
+The NMOS model was validated using Id-Vg, Id-Vd, and C-V characteristics. Extracted parameters include approximately `Vth = 0.277 V`, `kappa = 0.516`, and `C = 100 pF`.
 
 ### Mathematical Model Validation
 
-![Single synaptic LIF validation](images/slide10_image1.png)
-![Three synaptic LIF validation](images/slide10_image2.png)
+![Mathematical model validation](images/slide-10.png)
 
-The analytical neuro-transistor model was compared with SPICE simulation for single-synaptic and three-synaptic input cases. The membrane voltage prediction follows the simulated LIF behavior closely.
+The analytical neuro-transistor model was compared with SPICE simulations for single-synaptic and three-synaptic input cases. The model closely follows the simulated LIF membrane behavior.
 
 ### Current Mirror Circuit
 
-![Current mirror circuit](images/slide11_image3.png)
-![Current mirror simulation](images/slide11_image2.png)
+![Current mirror circuit](images/slide-11.png)
 
 The PMOS current mirror isolates the gate/membrane node from downstream loading. The PMOS width ratio gives a current gain of about `94/24 = 3.9`.
 
 ### Reset Circuit
 
-![Reset circuit](images/slide12_image2.png)
-![Reset circuit simulation](images/slide12_image1.png)
+![Reset circuit](images/slide-12.png)
 
-The reset circuit discharges the membrane after an output spike. When the output crosses the reset threshold, the gate voltage returns close to baseline, enabling repeated integrate-and-fire behavior.
+The reset circuit discharges the membrane after a spike. This allows the neuro-transistor to return close to baseline and fire repeatedly.
 
 ### Weight Configuration Testing
 
-![Weight testing ON OFF cases](images/slide13_image1.png)
+![Weight configuration testing](images/slide-13.png)
 
-Different ON/OFF memristor weight configurations were tested. The circuit produces spike and reset behavior across the tested cases, but strong `0.8 V` input pulses can still make weak/OFF cases fire.
+Different ON/OFF memristor weight states were tested. The circuit shows spike and reset behavior across weight configurations, though strong input pulses can still trigger firing in weak/OFF cases.
 
-### Fully Connected Two-Layer Network
+### Fully Connected Network: Layer 1
 
-![Layer 1 behavior](images/slide14_image1.png)
-![Fully connected circuit](images/slide14_image2.png)
-![Layer 2 behavior](images/slide15_image1.png)
+![Fully connected layer 1](images/slide-14.png)
 
-Three input neuro-transistors process MNIST pulse trains and drive one output neuro-transistor. The output neuron integrates the incoming spikes and fires, confirming successful spike propagation between layers.
+Three input neuro-transistors process MNIST-based pulse inputs independently and generate output spikes for the next layer.
+
+### Fully Connected Network: Layer 2
+
+![Fully connected layer 2](images/slide-15.png)
+
+The output neuron integrates spikes from the three input neurons and fires, showing successful spike propagation between connected layers.
 
 ### Strong Input Feedforward Test
 
-![Strong input feedforward behavior](images/slide16_image1.png)
-![Strong input neuron behavior](images/slide16_image2.png)
+![Feedforward connected neurons](images/slide-16.png)
 
-The connected-neuron architecture was also tested with stronger input activity, showing how synchronized first-layer spikes affect the output neuron response.
+The connected-neuron architecture was also tested with stronger input activity to observe how synchronized first-layer spikes affect the output neuron response.
 
-## Main Conclusion
+## Conclusion
 
-The project demonstrates that the neuro-transistor can be extended into a reusable spiking neuron circuit. The mathematical model predicts its behavior, the extracted NMOS parameters support accurate simulation, the current mirror solves the loading problem, the reset circuit enables repeated firing, and the connected-layer simulation shows that spikes can propagate through a small feedforward network.
+The project shows that the neuro-transistor can be modelled, simulated, reset after firing, and connected into a small feedforward spiking network. The current mirror solves gate-node loading, the reset circuit enables repeated firing, and the connected-layer simulations demonstrate multi-neuron spike propagation.
 
 ## How To Run
 
@@ -100,8 +96,8 @@ raw/
 
 - `memcap_model.py`: memristor/memcapacitor SPICE model
 - `MNIST.py`: MNIST loading and pulse-train generation
-- `neurocrossbar_functions.py`: crossbar circuit helper functions
+- `neurocrossbar_functions.py`: crossbar helper functions
 - `current_mirror_circuit_14_mnsit.py`: current mirror simulation
 - `reset_neurotransistor_14_mnist.py`: reset circuit simulation
-- `reset_on_off_cases.py`: ON/OFF weight validation
+- `reset_on_off_cases.py`: ON/OFF validation cases
 - `fully_connected_mnist_reset_14.py`: connected two-layer network simulation
