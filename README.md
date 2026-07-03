@@ -2,7 +2,9 @@
 
 This project studies a neuro-transistor circuit for spiking neural networks. A neuro-transistor behaves like a hardware leaky integrate-and-fire neuron: input spikes pass through memristive synapses, charge the gate/membrane capacitance, and produce an output spike when the membrane voltage crosses the transistor threshold.
 
-![Neuro-transistor circuit](Neurotransistor.png)
+<p align="center">
+  <img src="./images/Neurotransistor.png" alt="Neuro-transistor circuit" width="520">
+</p>
 
 ## Problem
 
@@ -22,43 +24,57 @@ The project solves these problems by developing a mathematical model, validating
 
 ### NMOS Model Validation
 
-![NMOS Id-Vg validation](id-vg.png)
+<p align="center">
+  <img src="./images/id-vg.png" alt="NMOS Id-Vg validation" width="480">
+</p>
 
 The NMOS behavior was verified using Id-Vg and Id-Vd characteristics. Extracted parameters such as threshold voltage and gate coupling were used in the neuro-transistor model.
 
 ### C-V Characteristics
 
-![C-V characteristics](cv-characteristics.png)
+<p align="center">
+  <img src="./images/cv-characteristics.png" alt="C-V characteristics" width="480">
+</p>
 
 The C-V analysis showed that the membrane capacitance is approximately constant around the operating region, with an extracted value of about 100 pF.
 
 ### Current Mirror Output
 
-![Current mirror output](current_mirror_output.png)
+<p align="center">
+  <img src="./images/current_mirror_output.png" alt="Current mirror output" width="560">
+</p>
 
 The PMOS current mirror isolates the high-impedance gate node from the next stage. It also provides current gain based on the PMOS width ratio, approximately 94/24 = 3.9.
 
 ### Reset Circuit
 
-![Reset circuit output](reset_circuit_output.png)
+<p align="center">
+  <img src="./images/reset_circuit_output.png" alt="Reset circuit output" width="560">
+</p>
 
 The reset circuit discharges the membrane after a spike. This allows the neuron to return close to baseline and fire again instead of staying continuously charged.
 
 ### Weight Configuration Testing
 
-![Weight configuration testing](weight_configuration.png)
+<p align="center">
+  <img src="./images/weight_configuration.png" alt="Weight configuration testing" width="560">
+</p>
 
 Different ON/OFF memristor weight configurations were tested. The circuit produced spike-and-reset behavior across the tested cases, while also showing that input scaling is important because strong inputs can make weak/OFF states fire.
 
 ### Connected Layer: Three Input Neurons
 
-![Layer 1 neurons](layer1_neurons.png)
+<p align="center">
+  <img src="./images/layer1_neurons.png" alt="Layer 1 neurons" width="560">
+</p>
 
 Three input neuro-transistors were driven by MNIST-based pulse trains. Each neuron integrated its input and generated output spikes for the next layer.
 
 ### Connected Layer: Output Neuron
 
-![Layer 2 output neuron](layer2_neuron.png)
+<p align="center">
+  <img src="./images/layer2_neuron.png" alt="Layer 2 output neuron" width="560">
+</p>
 
 The fourth neuron received spikes from the three input neurons, integrated them, and fired. This verifies feedforward spike propagation through a small connected neuro-transistor network.
 
